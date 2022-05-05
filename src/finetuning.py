@@ -4,6 +4,7 @@ import os
 
 import numpy as np
 import pandas as pd
+import torch
 from datasets import Dataset
 from scipy.special import softmax
 from sklearn import metrics
@@ -11,6 +12,7 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
                           DataCollatorWithPadding, EarlyStoppingCallback,
                           Trainer, TrainingArguments)
+
 
 def encode_data(tokenizer, sents, starts, ends, sym='[TGT]'):
     """
@@ -110,6 +112,9 @@ if __name__ == '__main__':
         evaluation_strategy="epoch",
         load_best_model_at_end=True)
 
+    # Set device to cuda if available
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     # prepare data
     # df = pd.read_csv(args.data_file)
     df = pd.read_csv('./data/normalised_edited_data.csv')
@@ -143,7 +148,7 @@ if __name__ == '__main__':
         tokenizer,
         test_sents,
         test_spans,
-        labels_test)
+        labels_test).set_format("torch")
 
     folds = []
     test_preds = []
@@ -174,7 +179,7 @@ if __name__ == '__main__':
 
         # model = AutoModelForSequenceClassification.from_pretrained(
         #     args.model_name, num_labels=len(label_mapping))
-        model = AutoModelForSequenceClassification.from_pretrained('emanjavacas/MacBERTh', num_labels=len(label_mapping))
+        model = AutoModelForSequenceClassification.from_pretrained('emanjavacas/MacBERTh', num_labels=len(label_mapping)).to(device)
         # this is needed, since we have expanded the tokenizer to incorporate
         # the target special token [TGT]
         model.resize_token_embeddings(len(tokenizer))
