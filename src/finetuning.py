@@ -12,7 +12,6 @@ from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
                           DataCollatorWithPadding, EarlyStoppingCallback,
                           Trainer, TrainingArguments)
 
-
 def encode_data(tokenizer, sents, starts, ends, sym='[TGT]'):
     """
     Transform input sentences into tokenized input for the model.
@@ -90,11 +89,11 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--model-name', default='emanjavacas/MacBERTh')
-    parser.add_argument('--epochs', type=int, default=35)
-    parser.add_argument('--data-file', default='./data/edited_data.csv')
+    parser.add_argument('--epochs', type=int, default=3)
+    parser.add_argument('--data-file', default='./data/normalised_edited_data.csv')
     # parser.add_argument('--test-files', nargs='+')
     parser.add_argument('--output-dir', default='./out/results')
-    parser.add_argument('--max-per-class', type=int, default=np.inf)
+    # parser.add_argument('--max-per-class', type=int, default=np.inf)
     parser.add_argument('--results-path', default='results.parquet')
     # parser.add_argument('--level', default='level-3')
     args = parser.parse_args()
@@ -112,22 +111,21 @@ if __name__ == '__main__':
         load_best_model_at_end=True)
 
     # prepare data
-    df = pd.read_csv(args.data_file)
-    df = df[df.Sense != 'Q'].copy()
+    # df = pd.read_csv(args.data_file)
+    df = pd.read_csv('./data/normalised_edited_data.csv')
+    df = df[df.Sense != 'Q']
     X_train, X_test, y_train, y_test = train_test_split(df, df.Sense, random_state=153, stratify=df.Sense)
     lhs, targets, rhs = X_train['Context before'], X_train['token'], X_train['Context after']
-    labels = X_train['Sense'].values
-    label_mapping = {key: idx for idx, key in enumerate(sorted(set(labels)))}
-    mapped_labels = list(map(label_mapping.get, labels))
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    label_mapping = {key: idx for idx, key in enumerate(sorted(set(df.Sense)))}
+    labels_train, labels_test = list(map(label_mapping.get, y_train)), list(map(label_mapping.get, y_test))
+    # tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained('emanjavacas/MacBERTh')
     tokenizer.add_special_tokens({'additional_special_tokens': ['[TGT]']})
     sents, spans = read_data(tokenizer, lhs, targets, rhs)
 
-    def get_dataset(sents, spans, labels=None):
+    def get_dataset(tokenizer, sents, spans, labels):
         dataset = {'text': sents, 'spans': spans}
-        # for the test set we don't have labels
-        if labels is not None:
-            dataset['label'] = labels
+        dataset['label'] = labels
         dataset = Dataset.from_dict(dataset)
 
         return dataset.map(
@@ -135,44 +133,48 @@ if __name__ == '__main__':
             batched=True
         ).remove_columns('text')
 
-    # these are datasets for which we want to output predictions
-    test_datasets = {}
+    # this is the dataset for which we want to output predictions
     test_sents, test_spans = read_data(
         tokenizer, 
         X_test['Context before'], 
         X_test['token'],
         X_test['Context after'])
-    test_datasets['test'] = get_dataset(
-        np.array(test_sents),
-        np.array(test_spans))
+    test_dataset = get_dataset(
+        tokenizer,
+        test_sents,
+        test_spans,
+        labels_test)
 
     folds = []
-    test_preds = collections.defaultdict(list)
+    test_preds = []
 
     for fold, (train, dev) in enumerate(StratifiedKFold(
             n_splits=5, shuffle=True, random_state=153
-            ).split(sents, labels)):
+            ).split(sents, labels_train)):
 
         # this relates to the experiments where we limit the amount of data per label
-        if args.max_per_class < np.inf:
-            train = pd.DataFrame(
-                {'labels': np.array(mapped_labels)[train], 'index': train}
-            ).groupby('labels').apply(
-                lambda g: sample_up_to_n(g, args.max_per_class)
-            ).reset_index(drop=True)['index'].values
+        # if args.max_per_class < np.inf:
+        #     train = pd.DataFrame(
+        #         {'labels': np.array(mapped_labels)[train], 'index': train}
+        #     ).groupby('labels').apply(
+        #         lambda g: sample_up_to_n(g, args.max_per_class)
+        #     ).reset_index(drop=True)['index'].values
 
         train_dataset = get_dataset(
+            tokenizer,
             np.array(sents)[train], 
             np.array(spans)[train], 
-            np.array(mapped_labels)[train])
+            np.array(labels_train)[train])
 
         dev_dataset = get_dataset(
+            tokenizer,
             np.array(sents)[dev], 
             np.array(spans)[dev], 
-            np.array(mapped_labels)[dev])
+            np.array(labels_train)[dev])
 
-        model = AutoModelForSequenceClassification.from_pretrained(
-            args.model_name, num_labels=len(set(labels)))
+        # model = AutoModelForSequenceClassification.from_pretrained(
+        #     args.model_name, num_labels=len(label_mapping))
+        model = AutoModelForSequenceClassification.from_pretrained('emanjavacas/MacBERTh', num_labels=len(label_mapping))
         # this is needed, since we have expanded the tokenizer to incorporate
         # the target special token [TGT]
         model.resize_token_embeddings(len(tokenizer))
@@ -195,18 +197,16 @@ if __name__ == '__main__':
         preds = np.argmax(preds, axis=1)
         folds.append({'index': dev, 'preds': preds, 'fold': fold, 'scores': scores})
 
-        for test in test_datasets:
-            preds, _, _ = trainer.predict(test_datasets[test])
-            test_preds[test].append(
-                {'preds': np.argmax(preds, axis=1),
-                 'scores': np.max(softmax(preds, axis=1), axis=1),
-                 'fold': fold})
+        preds, _, _ = trainer.predict(test_dataset)
+        test_preds.append({'preds': np.argmax(preds, axis=1),
+                'scores': np.max(softmax(preds, axis=1), axis=1),
+                'fold': fold})
 
-    if len(test_datasets) != 0:
-        for test, preds in test_preds.items():
-            infix = '.'.join(os.path.basename(test).split('.')[:-1])
-            output_path = '.'.join(args.results_path.split('.')[:-1]) + \
-                ".test={}.parquet".format(infix)
-            pd.concat([pd.DataFrame(fold) for fold in preds]).to_parquet(output_path)
+    # if len(test_datasets) != 0:
+    #     for test, preds in test_preds.items():
+    #         infix = '.'.join(os.path.basename(test).split('.')[:-1])
+    #         output_path = '.'.join(args.results_path.split('.')[:-1]) + \
+    #             ".test={}.parquet".format(infix)
+    #         pd.concat([pd.DataFrame(fold) for fold in preds]).to_parquet(output_path)
 
-    pd.concat([pd.DataFrame(fold) for fold in folds]).to_parquet(args.results_path)
+    # pd.concat([pd.DataFrame(fold) for fold in folds]).to_parquet(args.results_path)
